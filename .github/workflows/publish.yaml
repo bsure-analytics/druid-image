@@ -1,0 +1,120 @@
+# Publishes Apache Druid as a multi-arch image (linux/amd64, linux/arm64) to
+# ghcr.io/bsure-analytics/druid, because apache/druid is published for linux/amd64 only.
+#
+# The image is built by the upstream Dockerfile at the release tag, unchanged, but fed with
+# the signed binary release instead of a Maven build (BUILD_FROM_SOURCE=false). The release
+# is pure Java, so the same tarball serves both architectures, with the same extensions and
+# release versions as apache/druid.
+#
+# Pull requests build and test without pushing. A push to main publishes DRUID_VERSION
+# unless that tag exists already - published tags are never overwritten.
+---
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+env:
+  # Bumped by Renovate from the apache/druid GitHub releases - see renovate.json:
+  DRUID_VERSION: 38.0.0
+  IMAGE: ghcr.io/${{ github.repository_owner }}/druid
+jobs:
+  publish:
+    # ubuntu-latest rather than the org's self-hosted runners: this repository is public,
+    # and runner groups do not serve public repositories by default.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: druid
+          ref: druid-${{ env.DRUID_VERSION }}
+          repository: apache/druid
+      - name: Download and verify the binary release
+        # downloads.apache.org keeps the current releases only, archive.apache.org all of them.
+        run: |
+          fetch() {
+            for base in https://downloads.apache.org/druid https://archive.apache.org/dist/druid; do
+              curl --fail --location --silent --show-error --remote-name "$base/$1" && return
+            done
+            return 1
+          }
+          tarball="apache-druid-$DRUID_VERSION-bin.tar.gz"
+          mkdir -p druid/distribution/target
+          cd druid/distribution/target
+          fetch KEYS
+          fetch "$DRUID_VERSION/$tarball"
+          fetch "$DRUID_VERSION/$tarball.asc"
+          fetch "$DRUID_VERSION/$tarball.sha512"
+          echo "$(cat "$tarball.sha512")  $tarball" | sha512sum --check
+          gpg --batch --import KEYS
+          gpg --batch --verify "$tarball.asc" "$tarball"
+          rm KEYS "$tarball.asc" "$tarball.sha512"
+      - id: published
+        name: Check whether the tag is published already
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:$DRUID_VERSION" > /dev/null 2>&1; then
+            echo "::notice::$IMAGE:$DRUID_VERSION exists already and will not be pushed again"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      # The final stage runs a few RUN steps, which need emulation for linux/arm64. The
+      # builder stage is pinned to linux/amd64 upstream and runs natively here.
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - name: Build and test each platform
+        # Builds into the builder's cache, so the push below rebuilds nothing.
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            docker buildx build druid \
+              --build-arg BUILD_FROM_SOURCE=false \
+              --file druid/distribution/docker/Dockerfile \
+              --load \
+              --platform "$platform" \
+              --tag "druid:test"
+            docker run --rm --entrypoint /bin/sh --platform "$platform" druid:test -c '
+              ls extensions/druid-kubernetes-overlord-extensions extensions/postgresql-metadata-storage > /dev/null &&
+              bin/run-java -cp "lib/*" org.apache.druid.cli.Main version
+            ' | tee version.txt
+            grep --fixed-strings --quiet "$DRUID_VERSION" version.txt
+          done
+      - id: meta
+        uses: docker/metadata-action@v6
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+        with:
+          images: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.description=Unofficial multi-arch build of Apache Druid ${{ env.DRUID_VERSION }} from the signed binary release
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.title=Apache Druid
+            org.opencontainers.image.version=${{ env.DRUID_VERSION }}
+          tags: type=raw,value=${{ env.DRUID_VERSION }}
+      - if: github.event_name != 'pull_request' && steps.published.outputs.exists == 'false'
+        uses: docker/login-action@v4
+        with:
+          password: ${{ github.token }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+      - if: github.event_name != 'pull_request' && steps.published.outputs.exists == 'false'
+        uses: docker/build-push-action@v7
+        with:
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: BUILD_FROM_SOURCE=false
+          context: druid
+          file: druid/distribution/docker/Dockerfile
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          provenance: mode=max
+          push: true
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+name: Publish
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+    paths-ignore: [ '**.md' ]
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write # push the image to ghcr.io
