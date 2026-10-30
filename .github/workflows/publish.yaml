@@ -6,21 +6,79 @@
 # is pure Java, so the same tarball serves both architectures, with the same extensions and
 # release versions as apache/druid.
 #
-# Pull requests build and test without pushing. A push to main publishes DRUID_VERSION
-# unless that tag exists already - published tags are never overwritten.
+# Every night, and on every push to main, the apache/druid GitHub releases since
+# OLDEST_VERSION are compared with the published tags, and each missing one is built and
+# pushed - backports to older release lines included. Published tags are never overwritten.
+# Pull requests build and test the latest release without pushing. A manual run builds the
+# given version.
 ---
 concurrency:
-  cancel-in-progress: true
+  # A push to main must not cancel a nightly run, which shares its ref:
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
   group: ${{ github.workflow }}-${{ github.ref }}
 env:
-  # Bumped by Renovate from the apache/druid GitHub releases - see renovate.json:
-  DRUID_VERSION: 38.0.0
   IMAGE: ghcr.io/${{ github.repository_owner }}/druid
+  # Releases before this one are never built:
+  OLDEST_VERSION: 38.0.0
 jobs:
+  versions:
+    outputs:
+      versions: ${{ steps.versions.outputs.versions }}
+    permissions:
+      actions: write # re-enable this workflow, see below
+    runs-on: ubuntu-latest
+    steps:
+      - id: versions
+        name: Find the versions to build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            versions="$INPUT_VERSION"
+          else
+            releases="$(gh api 'repos/apache/druid/releases?per_page=30' --jq '
+              .[] | select((.draft or .prerelease) | not) | .tag_name
+                  | select(startswith("druid-")) | ltrimstr("druid-")
+            ' | sort --version-sort --reverse)"
+            if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+              releases="$(echo "$releases" | head -n 1)"
+            fi
+            versions=""
+            for version in $releases; do
+              oldest="$(printf '%s\n%s\n' "$OLDEST_VERSION" "$version" | sort --version-sort | head -n 1)"
+              [ "$oldest" = "$OLDEST_VERSION" ] || continue
+              if [ "$GITHUB_EVENT_NAME" = pull_request ] ||
+                ! docker buildx imagetools inspect "$IMAGE:$version" > /dev/null 2>&1; then
+                versions="$versions $version"
+              fi
+            done
+          fi
+          echo "Versions to build:${versions:- none}"
+          echo "versions=$(jq --arg versions "$versions" --compact-output --null-input \
+            '$versions | split(" ") | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
+      - if: github.event_name == 'schedule'
+        name: Keep the schedule alive
+        # GitHub disables scheduled workflows in public repositories after 60 days without
+        # repository activity. Re-enabling the workflow resets that timer.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/publish.yaml/enable"
   publish:
+    env:
+      DRUID_VERSION: ${{ matrix.version }}
+    if: needs.versions.outputs.versions != '[]'
+    needs: versions
+    permissions:
+      contents: read
+      packages: write # push the image to ghcr.io
     # ubuntu-latest rather than the org's self-hosted runners: this repository is public,
     # and runner groups do not serve public repositories by default.
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.versions.outputs.versions) }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -114,7 +172,13 @@ on:
   push:
     branches: [ main ]
     paths-ignore: [ '**.md' ]
+  schedule:
+    - cron: '17 3 * * *'
   workflow_dispatch:
+    inputs:
+      version:
+        description: Druid version to build, e.g. 38.0.0 - the missing releases if empty
+        required: false
+        type: string
 permissions:
   contents: read
-  packages: write # push the image to ghcr.io

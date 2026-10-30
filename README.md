@@ -17,9 +17,10 @@ This is an unofficial build, not a release of the Apache Software Foundation.
 
 ## Releases
 
-The version to publish is `DRUID_VERSION` in [`.github/workflows/publish.yaml`](.github/workflows/publish.yaml).
-Renovate opens a pull request when Apache publishes a new Druid release. The pull request builds and smoke-tests both
-architectures; merging it publishes the tag. Published tags are never overwritten.
+Every night, [the workflow](.github/workflows/publish.yaml) compares the
+[Apache Druid releases](https://github.com/apache/druid/releases) since `OLDEST_VERSION` with the published tags, then
+builds, smoke-tests and publishes each missing one, so a new release appears here by the next morning. Published tags
+are never overwritten. A manual run of the workflow builds a given version.
 
 ## License
 

@@ -1,15 +1,4 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["local>bsure-analytics/renovate-config"],
-  "customManagers": [
-    {
-      "customType": "regex",
-      "datasourceTemplate": "github-releases",
-      "depNameTemplate": "apache/druid",
-      "description": "The Druid release to publish",
-      "extractVersionTemplate": "^druid-(?<version>.+)$",
-      "managerFilePatterns": ["/^\\.github/workflows/publish\\.yaml$/"],
-      "matchStrings": ["DRUID_VERSION: (?<currentValue>\\S+)"]
-    }
-  ]
+  "extends": ["local>bsure-analytics/renovate-config"]
 }
